@@ -235,7 +235,15 @@ async def route_node(state: GaokaoState) -> dict:
         }
 
     # Step 5: 检测用户是否在明确问某所学校
-    school_match = re.search(r"([一-龥]{2,6}(?:大学|学院|高校)).*?(?:怎么|如何|是什么|了解)", last_human)
+    # 匹配: XX大学怎么样 / XX学院能报吗 / XX高校可以吗 / XX大学有机会吗 / XX大学能上吗 / XX稳吗
+    school_match = re.search(
+        r"([一-龥]{2,6}(?:大学|学院|高校|院校))"
+        r".*?(?:怎么|如何|能报|不能报|能上|能冲|可以|好吗|好不好|了解|推荐|怎么样|行不行|合适|有机会|可能性|稳吗|保底|咋样)",
+        last_human,
+    )
+    # 也匹配省略后缀的: "东北林业大学" 单独出现 / "XX大学呢" 也视为想查学校
+    if not school_match:
+        school_match = re.search(r"([一-龥]{2,4}(?:大学|学院))(?:呢|吧|啊)?(?:$|[\s,，。！？!?]|(?!\w))", last_human)
     if school_match:
         school_name = school_match.group(1)
         action = {"intent": "school", "school_name": school_name, "reply": None}
@@ -270,6 +278,7 @@ async def route_node(state: GaokaoState) -> dict:
 
     # Step 7: 无明确意图 → 按推荐流程检查信息完整性
     missing = _missing_fields(merged_profile)
+    current_stage = state.get("stage", "collecting")
 
     if missing:
         # 有缺失 → 生成追问
@@ -306,7 +315,16 @@ async def route_node(state: GaokaoState) -> dict:
             "messages": [AIMessage(content=reply, additional_kwargs={"action": action})],
         }
 
-    # Step 8: 信息齐全 → 走推荐
+    # Step 8: 信息齐全，但已推荐过 → 走 chat（避免重复推荐）
+    if current_stage in ("recommending", "deep_dive"):
+        action = {"intent": "chat", "reply": None}
+        return {
+            "user_profile": merged_profile,
+            "stage": current_stage,
+            "messages": [AIMessage(content="", additional_kwargs={"action": action})],
+        }
+
+    # Step 9: 首次信息齐全 → 走推荐
     action = {
         "intent": "recommend",
         "province": merged_profile.get("province", "辽宁"),
@@ -382,22 +400,98 @@ async def tool_node(state: GaokaoState) -> dict:
     ]}
 
 
+def _extract_relevant_entries(messages: list, school_name: str | None, major_name: str | None) -> str:
+    """从推荐历史中提取匹配学校/专业的条目，格式化为可注入的上下文块。"""
+    # 找到最近一次 recommend_schools 工具结果
+    rec_data = None
+    for msg in reversed(messages):
+        content = msg.content if hasattr(msg, "content") else str(msg)
+        if "[工具 recommend_schools 返回结果]" in content:
+            try:
+                json_str = content.split("[工具 recommend_schools 返回结果]\n", 1)[1]
+                rec_data = json.loads(json_str)
+            except Exception:
+                pass
+            break
+
+    if not rec_data:
+        return ""
+
+    entries: list[dict] = []
+    for cat, cat_label in [("reach", "冲"), ("stable", "稳"), ("safe", "保")]:
+        for item in rec_data.get(cat, []):
+            item_school = item.get("school", "")
+            item_major = item.get("major", "")
+            matched = False
+            if school_name and school_name in item_school:
+                matched = True
+            elif major_name and (major_name in item_major or major_name in item.get("major_category", "")):
+                matched = True
+            if matched:
+                entries.append({
+                    **item,
+                    "_category": cat_label,
+                })
+
+    if not entries:
+        return ""
+
+    lines = [f"## 推荐结果中匹配「{school_name or major_name}」的条目（从你的冲/稳/保列表中提取）"]
+    for e in entries:
+        parts = [
+            f"- {e['_category']} | {e.get('school','')} — {e.get('major','')}",
+            f"  录取概率 {e.get('probability','?')}%，位次约 {e.get('rank','?')}，趋势 {e.get('trend','?')}",
+        ]
+        if e.get("cv") and float(e.get("cv", 0)) >= 25:
+            parts.append(f"  ⚠️ CV={e['cv']}%，大小年风险")
+        if e.get("warnings"):
+            parts.append(f"  ⚠️ {e['warnings']}")
+        lines.extend(parts)
+
+    return "\n".join(lines)
+
+
 async def response_node(state: GaokaoState) -> dict:
     """Generate final response with context awareness."""
     profile = state.get("user_profile", {})
     stage = state.get("stage", "collecting")
     context_block = _build_context_prompt(profile)
 
+    # 提取本轮意图，用于从推荐历史中匹配相关条目
+    action_data: dict = {}
+    for msg in reversed(state["messages"]):
+        if hasattr(msg, "additional_kwargs") and msg.additional_kwargs.get("action"):
+            action_data = msg.additional_kwargs["action"]
+            break
+
     # 构建带上下文注入的 system message
     system_content = SYSTEM_PROMPT
     if context_block:
         system_content = context_block + "\n\n" + SYSTEM_PROMPT
+
     if stage == "collecting":
         system_content += "\n\n当前处于信息收集阶段，请友好地引导用户补全信息。"
     elif stage == "recommending":
         system_content += "\n\n当前处于推荐阶段，请严格按照工具返回的数据输出冲/稳/保格式。"
     elif stage == "deep_dive":
-        system_content += "\n\n当前处于深度了解阶段，针对用户问的学校或专业给出详细分析。回答完可以轻轻提醒用户如有需要可回到志愿推荐。"
+        intent = action_data.get("intent", "")
+        school_name = action_data.get("school_name", "")
+        major_name = action_data.get("major_name", "")
+        injected = ""
+        if intent in ("school", "major"):
+            injected = _extract_relevant_entries(
+                list(state["messages"]),
+                school_name if intent == "school" else None,
+                major_name if intent == "major" else None,
+            )
+        system_content += (
+            "\n\n当前处于深度了解阶段。"
+            "**规则**：只输出工具返回的真实数据 + 下面「推荐结果匹配条目」中的数据。"
+            "没有数据就说没有，禁止编造、禁止评论、禁止车轱辘话。"
+            "回复不超过 250 字，用列表而非段落。"
+        )
+        if injected:
+            system_content += f"\n\n{injected}"
 
     context_system_msg = SystemMessage(content=system_content)
     response = await llm_respond.ainvoke([context_system_msg] + list(state["messages"]))
@@ -408,7 +502,11 @@ def route_after_classify(state: GaokaoState) -> str:
     last_msg = state["messages"][-1]
     action_data = last_msg.additional_kwargs.get("action", {})
     intent = action_data.get("intent", "chat")
+    reply = action_data.get("reply")
     if intent == "chat":
+        if reply is None:
+            # 无预生成回复 → 走 LLM 生成
+            return "respond"
         return END
     return "tools"
 
@@ -427,7 +525,7 @@ def build_graph() -> StateGraph:
     workflow.add_conditional_edges(
         "route",
         route_after_classify,
-        {"tools": "tools", END: END},
+        {"tools": "tools", "respond": "respond", END: END},
     )
     workflow.add_edge("tools", "respond")
     workflow.add_edge("respond", END)
